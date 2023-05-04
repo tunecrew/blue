@@ -7,7 +7,8 @@ import logging
 import re
 import sys
 
-from dataclasses import dataclass
+from configparser import ConfigParser
+
 from importlib import machinery
 
 __version__ = '0.9.1'
@@ -70,7 +71,7 @@ import black.strings
 
 from black import Leaf, Path, click, token
 from black.cache import user_cache_dir
-from black.comments import ProtoComment, LN, make_comment
+from black.comments import ProtoComment, make_comment
 from black.files import tomli
 from black.linegen import LineGenerator as BlackLineGenerator
 from black.lines import Line
@@ -86,9 +87,6 @@ from black.strings import (
     normalize_string_prefix,
     sub_twice,
 )
-
-from flake8.options import config as flake8_config
-from flake8.options import manager as flake8_manager
 
 from enum import Enum
 from functools import lru_cache
@@ -145,8 +143,6 @@ BLUE_MONKEYPATCHES = [
     (black.trans, 'normalize_string_quotes', Mode.asynchronous),
     (black.comments, 'list_comments', Mode.asynchronous),
     (black.linegen, 'list_comments', Mode.asynchronous),
-    (black.comments, 'generate_comments', Mode.asynchronous),
-    (black.linegen, 'generate_comments', Mode.asynchronous),
 ]
 
 
@@ -264,35 +260,24 @@ def normalize_string_quotes(s: str) -> str:
     return f'{prefix}{new_quote}{new_body}{new_quote}'
 
 
-@dataclass
-class WSProtoComment(ProtoComment):
-    whitespace: int  # how much whitespace originally preceded the comment
-
-
-def generate_comments(leaf: LN) -> Iterator[Leaf]:
-    for pc in list_comments(leaf.prefix, is_endmarker=leaf.type == token.ENDMARKER):
-        yield Leaf(pc.type, pc.value, prefix="\n" * pc.newlines + " " * pc.whitespace)
-
-
 # Like black's list_comments() but preserves whitespace leading up to the hash
 # mark.  Because what we really need to do is restore the whitespace after the
 # line.lstrip() statement, there really is no good way to more narrowly
 # monkeypatch.  This would be a good hook to install.  See
 # https://github.com/grantjenks/blue/issues/14
 @lru_cache(maxsize=4096)
-def list_comments(prefix: str, *, is_endmarker: bool) -> List[WSProtoComment]:
+def list_comments(prefix: str, *, is_endmarker: bool) -> List[ProtoComment]:
     """Return a list of :class:`ProtoComment` objects parsed from the given `prefix`."""
-    result: List[WSProtoComment] = []
+    result: List[ProtoComment] = []
     if not prefix or "#" not in prefix:
         return result
 
     consumed = 0
     nlines = 0
     ignored_lines = 0
-    for index, line in enumerate(prefix.split("\n")):
-        orig_len = len(line)
-        consumed += orig_len + 1  # adding the length of the split '\n'
-        line = line.lstrip()
+    for index, orig_line in enumerate(prefix.split("\n")):
+        consumed += len(orig_line) + 1  # adding the length of the split '\n'
+        line = orig_line.lstrip()
         if not line:
             nlines += 1
         if not line.startswith("#"):
@@ -307,14 +292,26 @@ def list_comments(prefix: str, *, is_endmarker: bool) -> List[WSProtoComment]:
             comment_type = token.COMMENT  # simple trailing comment
         else:
             comment_type = STANDALONE_COMMENT
-        comment = make_comment(line)
-        # Track the original whitespace for a line, adjusting down for the two
-        # spaces black prepends
-        whitespace = max(0, orig_len - len(line) - 2)
+        # Restore the original whitespace, but only for hanging comments.  We
+        # use a heuristic to figure out hanging comments since that information
+        # isn't explicitly passed in here (no, `is_endmarker` doesn't tell us,
+        # apparently).  Hanging comments seem to not have a newline in prefix.
+        #
+        # Note however that the whitespace() function in black will add back
+        # two leading spaces (see DOUBLESPACE).  Rather than monkey patch the
+        # entire function, let's just remove up to two spaces before the hash
+        # character.
+        if '\n' not in prefix:
+            whitespace = orig_line[:-len(line)]
+            if len(whitespace) >= 2:
+                whitespace = whitespace[2:]
+            comment = whitespace + make_comment(line)
+        else:
+            comment = make_comment(line)
         result.append(
-            WSProtoComment(
+            ProtoComment(
                 type=comment_type, value=comment, newlines=nlines,
-                consumed=consumed, whitespace=whitespace,
+                consumed=consumed
             )
         )
         nlines = 0
@@ -395,21 +392,19 @@ def format_file_in_place(*args, **kws):
     return black_format_file_in_place(*args, **kws)
 
 
-try:
-    BaseConfigParser = flake8_config.ConfigParser              # flake8 v4
-except AttributeError:
-    BaseConfigParser = flake8_config.MergedConfigParser        # flake8 v3
+def load_configs_from_file() -> Dict[str, Any]:
+    """Parses supported config files using configparser"""
+    config_dict = {}
+    pwd = Path('.').resolve()
+    supported_config_files = ('setup.cfg', 'tox.ini', '.blue')
+    filenames = [(pwd / config_file) for config_file in supported_config_files]
+    cfg = ConfigParser()
+    cfg.read(filenames)
 
+    if cfg.has_section('blue'):
+        config_dict.update(cfg.items('blue'))
 
-class MergedConfigParser(BaseConfigParser):
-    def _parse_config(self, config_parser, parent=None):
-        """Skip option parsing in flake8's config parsing."""
-        config_dict = {}
-        for option_name in config_parser.options(self.program_name):
-            value = config_parser.get(self.program_name, option_name)
-            LOG.debug('Option "%s" has value: %r', option_name, value)
-            config_dict[option_name] = value
-        return config_dict
+    return config_dict
 
 
 def read_configs(
@@ -418,12 +413,9 @@ def read_configs(
     """Read configs through the config param's callback hook."""
     # Use black's `read_pyproject_toml` for the default
     result = black.read_pyproject_toml(ctx, param, value)
-    # Use flake8's config file parsing to load setup.cfg, tox.ini, and .blue
+    # parses setup.cfg, tox.ini, and .blue config files
     # The parsing looks both in the project and user directories.
-    finder = flake8_config.ConfigFileFinder('blue')
-    manager = flake8_manager.OptionManager('blue', '0')
-    parser = MergedConfigParser(manager, finder)
-    config = parser.parse()
+    config = load_configs_from_file()
     # Merge the configs into Click's `default_map`.
     default_map: Dict[str, Any] = {}
     default_map.update(ctx.default_map or {})
@@ -450,7 +442,7 @@ def main():
         'Black', 'Blue'
     )
     # Change the config param callback to support setup.cfg, tox.ini, etc.
-    config_param = black.main.params[26]
+    config_param = black.main.params[25]
     assert config_param.name == 'config'
     config_param.callback = read_configs
     # Change the version string by adding a redundant Click `version_option`
